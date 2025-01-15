@@ -1,0 +1,228 @@
+import base64
+import requests
+from datetime import datetime, timedelta
+from collections import defaultdict
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Huntress API credentials and endpoint
+API_KEY = ''
+API_SECRET = ''
+BASE_URL = 'https://api.huntress.io/v1'
+
+# Airtable credentials (replace with your own)
+AIRTABLE_API_KEY = ""
+AIRTABLE_BASE_ID = ""
+AIRTABLE_TABLE_NAME = ""
+
+# Rate limiting for Airtable API
+REQUESTS_PER_MINUTE = 60  # Adjust as needed
+SECONDS_PER_REQUEST = 60 / REQUESTS_PER_MINUTE
+
+# Create the Base64 encoded hash for authentication
+auth_string = f"{API_KEY}:{API_SECRET}"
+encoded_auth = base64.b64encode(auth_string.encode()).decode()
+
+def get_previous_quarter_date_range(current_date: datetime):
+    """
+    Calculates the start and end dates of the previous quarter.
+
+    Args:
+        current_date: The current date.
+
+    Returns:
+        A tuple containing the start and end dates of the previous quarter.
+    """
+    if 1 <= current_date.month <= 3:
+        # Current quarter is Q1, so previous quarter is Q4 of previous year
+        start_date = datetime(current_date.year - 1, 10, 1)
+        end_date = datetime(current_date.year - 1, 12, 31)
+    elif 4 <= current_date.month <= 6:
+        # Current quarter is Q2
+        start_date = datetime(current_date.year, 1, 1)
+        end_date = datetime(current_date.year, 3, 31)
+    elif 7 <= current_date.month <= 9:
+        # Current quarter is Q3
+        start_date = datetime(current_date.year, 4, 1)
+        end_date = datetime(current_date.year, 6, 30)
+    else:
+        # Current quarter is Q4
+        start_date = datetime(current_date.year, 7, 1)
+        end_date = datetime(current_date.year, 9, 30)
+
+    return start_date, end_date
+
+# Function to fetch incidents from Huntress API (with proper pagination handling)
+def fetch_incidents(start_date, end_date, page=1, limit=100):
+    url = f"{BASE_URL}/incident_reports"
+    headers = {
+        'Authorization': f'Basic {encoded_auth}'
+    }
+    params = {
+        'page': page,
+        'limit': limit,
+        'updated_at_min': start_date.isoformat(),
+        'updated_at_max': end_date.isoformat(),
+    }
+    response = requests.get(url, params=params, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+# Function to fetch all organizations from Huntress API with pagination
+def fetch_all_organizations(limit=100):
+    url = f"{BASE_URL}/organizations"
+    headers = {
+        'Authorization': f'Basic {encoded_auth}'
+    }
+    all_organizations = []
+    page = 1
+
+    while True:
+        params = {
+            'page': page,
+            'limit': limit
+        }
+        try:
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            all_organizations.extend(data['organizations'])
+
+            # Check for the next page using the pagination object
+            if 'next_page' not in data['pagination'] or data['pagination']['next_page'] is None:
+                break  # No more pages
+
+            page = data['pagination']['next_page']
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching organizations: {str(e)}")
+            print(f"Error fetching organizations: {str(e)}")
+            return []  # Return empty list on error
+
+    return all_organizations
+
+# Function to get the last day of a quarter
+def get_last_day_of_quarter(year, quarter):
+    if quarter == 1:
+        return f"{year}-03-31"
+    elif quarter == 2:
+        return f"{year}-06-30"
+    elif quarter == 3:
+        return f"{year}-09-30"
+    else:  # quarter == 4
+        return f"{year}-12-31"
+
+# Function to upload data to Airtable
+def upload_to_airtable(org_incidents, org_names, previous_quarter_year, previous_quarter):
+    airtable_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    for org_id, quarter_data in org_incidents.items():
+        org_name = org_names.get(org_id)
+
+        # Skip if organization name is "None" or "Unknown Organization"
+        if org_name == "None" or org_name == "Unknown Organization":
+            logging.info(f"Skipping organization with ID {org_id} because the name is '{org_name}'")
+            continue
+
+        # Ensure the previous quarter's data is uploaded even if the incident count is 0
+        incident_count = quarter_data.get(previous_quarter, 0)
+        last_day_of_quarter = get_last_day_of_quarter(previous_quarter_year, previous_quarter)
+
+        fields = {
+            "Company Name": org_name,
+            "Escalations": incident_count,
+            "Quarter": last_day_of_quarter
+        }
+        record_data = {"fields": fields}
+
+        try:
+            response = requests.post(airtable_url, headers=headers, json=record_data)
+            response.raise_for_status()
+            logging.info(f"Successfully uploaded data for {org_name}, Q{previous_quarter} {previous_quarter_year} to Airtable (incident count: {incident_count})")
+            print(f"Successfully uploaded data for {org_name}, Q{previous_quarter} {previous_quarter_year} to Airtable (incident count: {incident_count})")
+
+        except requests.exceptions.HTTPError as e:
+            logging.error(f"HTTP error while uploading data for {org_name}, Q{previous_quarter} {previous_quarter_year}: {e.response.status_code} - {e.response.text}")
+            print(f"HTTP error while uploading data for {org_name}, Q{previous_quarter} {previous_quarter_year}: {e.response.status_code} - {e.response.text}")
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to upload data to Airtable for {org_name}, Q{previous_quarter} {previous_quarter_year}: {str(e)}")
+            print(f"Failed to upload data to Airtable for {org_name}, Q{previous_quarter} {previous_quarter_year}: {str(e)}")
+
+        finally:
+            time.sleep(SECONDS_PER_REQUEST)
+            print(f"Waiting {SECONDS_PER_REQUEST} seconds due to rate limiting...")
+
+def main():
+    # Get the current date
+    current_date = datetime.now()
+
+    # Get the start and end dates of the previous quarter
+    start_date, end_date = get_previous_quarter_date_range(current_date)
+    print(f"Start Date: {start_date}")
+    print(f"End Date: {end_date}")
+
+    # Determine the year and quarter number of the previous quarter
+    previous_quarter_year = start_date.year
+    previous_quarter = (start_date.month - 1) // 3 + 1
+
+    # Fetch all incidents for the previous quarter with proper pagination
+    all_incidents = []
+    page = 1
+    limit = 100  # You can adjust the limit (max 500)
+    while True:
+        try:
+            data = fetch_incidents(start_date, end_date, page=page, limit=limit)
+            all_incidents.extend(data['incident_reports'])
+
+            # Check for the next page using the pagination object
+            if 'next_page' not in data['pagination'] or data['pagination']['next_page'] is None:
+                break  # No more pages, exit the loop
+
+            page = data['pagination']['next_page']  # Use next_page from pagination object
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching incidents: {str(e)}")
+            print(f"Error fetching incidents: {str(e)}")
+            break  # Exit the while loop on error (Option 1)
+
+    # Check if any incidents were fetched
+    if not all_incidents:
+        logging.error("No incidents were fetched. Exiting.")
+        return
+
+    # Fetch all organizations
+    all_organizations = fetch_all_organizations()
+    if not all_organizations:
+        logging.error("No organizations fetched. Exiting.")
+        return
+
+    # Initialize org_incidents with all fetched org_ids and default to 0 incidents for the previous quarter
+    org_incidents = defaultdict(lambda: defaultdict(int))
+    for org in all_organizations:
+        org_incidents[org['id']][previous_quarter] = 0  # Initialize all orgs with 0 incidents
+
+    # Organize incidents by org_id and quarter
+    for incident in all_incidents:
+        org_id = incident['organization_id']
+        print(f"Processing incident for org_id: {org_id}")  # Debug print
+        created_at = incident['updated_at']
+        incident_date = datetime.fromisoformat(created_at.rstrip('Z'))
+        quarter = (incident_date.month - 1) // 3 + 1
+        org_incidents[org_id][quarter] += 1
+
+    # Create a dictionary of organization names using the fetched data
+    org_names = {org['id']: org['name'] for org in all_organizations}
+
+    # Upload data to Airtable for the previous quarter
+    upload_to_airtable(org_incidents, org_names, previous_quarter_year, previous_quarter)
+
+if __name__ == "__main__":
+    main()
