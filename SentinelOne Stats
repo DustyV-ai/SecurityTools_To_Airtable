@@ -1,0 +1,287 @@
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+from typing import Dict, List, Optional
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Airtable configuration (Replace with your actual values)
+AIRTABLE_API_KEY = ""
+AIRTABLE_BASE_ID = ""
+AIRTABLE_TABLE_NAME = ""
+
+# API Rate Limiting - Adjust as needed
+REQUESTS_PER_MINUTE = 60  # Example: Limit to 60 requests per minute
+SECONDS_PER_REQUEST = 60 / REQUESTS_PER_MINUTE
+
+class SentinelOneAPI:
+    def __init__(self, api_token: str, domain: str):
+        self.api_token = api_token
+        self.base_url = f"https://{domain}/web/api/v2.0"
+        self.headers = {
+            "Authorization": f"ApiToken {api_token}",
+            "Content-Type": "application/json"
+        }
+
+    def get_threats(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> List[Dict]:
+        threats = []
+        limit = 1000
+        cursor = None
+
+        while True:
+            url = f"{self.base_url}/threats"
+            params = {
+                "createdAt__gte": start_date.isoformat(),
+                "createdAt__lte": end_date.isoformat(),
+                "limit": limit,
+                "sortBy": "createdAt",
+                "sortOrder": "desc"
+            }
+
+            if cursor:
+                params["cursor"] = cursor
+
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            threats.extend(data.get("data", []))
+
+            pagination = data.get("pagination", {})
+            cursor = pagination.get("nextCursor")
+
+            if not cursor:
+                break
+
+        return threats
+
+def get_previous_quarter_date_range(current_date: datetime):
+    """
+    Calculates the start and end dates of the previous quarter.
+
+    Args:
+        current_date: The current date.
+
+    Returns:
+        A tuple containing the start and end dates of the previous quarter.
+    """
+    if 1 <= current_date.month <= 3:
+        # Current quarter is Q1, so previous quarter is Q4 of previous year
+        start_date = datetime(current_date.year - 1, 10, 1)
+        end_date = datetime(current_date.year - 1, 12, 31)
+    elif 4 <= current_date.month <= 6:
+        # Current quarter is Q2
+        start_date = datetime(current_date.year, 1, 1)
+        end_date = datetime(current_date.year, 3, 31)
+    elif 7 <= current_date.month <= 9:
+        # Current quarter is Q3
+        start_date = datetime(current_date.year, 4, 1)
+        end_date = datetime(current_date.year, 6, 30)
+    else:
+        # Current quarter is Q4
+        start_date = datetime(current_date.year, 7, 1)
+        end_date = datetime(current_date.year, 9, 30)
+
+    return start_date, end_date
+
+def get_quarter(date: datetime) -> str:
+    """Convert date to quarter string (e.g., '2024-Q1')"""
+    return f"{date.year}-Q{(date.month - 1) // 3 + 1}"
+
+def get_last_day_of_quarter(quarter_label: str) -> str:
+    """
+    Get the last day of the quarter as a string in YYYY-MM-DD format.
+
+    Args:
+        quarter_label: The quarter label (e.g., "2023-Q3").
+
+    Returns:
+        The last day of the quarter in YYYY-MM-DD format.
+    """
+    year = int(quarter_label.split("-Q")[0])
+    quarter = int(quarter_label.split("-Q")[1])
+
+    if quarter == 1:
+        last_day = datetime(year, 3, 31)
+    elif quarter == 2:
+        last_day = datetime(year, 6, 30)
+    elif quarter == 3:
+        last_day = datetime(year, 9, 30)
+    else:  # quarter == 4
+        last_day = datetime(year, 12, 31)
+
+    return last_day.strftime("%Y-%m-%d")
+
+def create_site_quarterly_summaries(threats: List[Dict], quarter_label: str) -> pd.DataFrame:
+    """
+    Create quarterly summaries per site for a specific quarter.
+
+    Args:
+        threats (List[Dict]): List of threats
+        quarter_label (str): The quarter label (e.g., "2023-Q3").
+
+    Returns:
+        pd.DataFrame: DataFrame containing quarterly summaries for each site.
+    """
+    df = pd.DataFrame(threats)
+
+    # If there are no threats, create an empty DataFrame with required columns
+    if df.empty:
+        df = pd.DataFrame(columns=['createdAt', 'siteName', 'id', 'resolved'])
+
+    # Convert createdAt to datetime and filter by the specified quarter
+    df['createdAt'] = pd.to_datetime(df['createdAt'])
+    df['quarter'] = df['createdAt'].apply(get_quarter)
+    df = df[df['quarter'] == quarter_label]
+
+    # Store summary data
+    summary_data = []
+
+    # Get unique site names, if df is empty use a list with one empty site
+    site_names = sorted(df['siteName'].unique()) if not df.empty else ['No Sites Found']
+
+    # Process each site
+    for site_name in site_names:
+        site_df = df[df['siteName'] == site_name] if not df.empty else df
+
+        # Create quarterly summary for this site
+        if not site_df.empty:
+            site_summary = site_df.groupby('quarter').agg({
+                'id': 'count',  # Total threats
+                'resolved': ['sum', 'count']  # Sum of resolved (True) and total count
+            }).reset_index()
+
+            # Flatten column names
+            site_summary.columns = ['Quarter', 'Total Threats', 'Resolved Threats', 'Total for Calc']
+
+            # Calculate unresolved threats
+            site_summary['Unresolved Threats'] = site_summary['Total for Calc'] - site_summary['Resolved Threats']
+            site_summary = site_summary.drop('Total for Calc', axis=1)
+        else:
+            # Create empty summary with zero counts
+            site_summary = pd.DataFrame({
+                'Quarter': [quarter_label],
+                'Total Threats': 0,
+                'Resolved Threats': 0,
+                'Unresolved Threats': 0
+            })
+
+        # Collect summary data
+        for _, row in site_summary.iterrows():
+            summary_data.append({
+                'Site Name': site_name,
+                'Quarter': row['Quarter'],
+                'Total Threats': int(row['Total Threats']),
+                'Resolved Threats': int(row['Resolved Threats']),
+                'Unresolved Threats': int(row['Unresolved Threats'])
+            })
+
+    # Create overview DataFrame
+    overview_df = pd.DataFrame(summary_data)
+    overview_df = overview_df.sort_values(['Quarter', 'Site Name'])
+
+    return overview_df
+  
+def upload_to_airtable(df: pd.DataFrame):
+    """
+    Upload DataFrame data to Airtable.
+
+    Args:
+        df: DataFrame containing quarterly summaries for each site.
+    """
+    airtable_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    for index, row in df.iterrows():
+        # Skip upload if site name is 'No Sites Found'
+        if row["Site Name"] == "No Sites Found":
+            logging.info("Skipping upload for 'No Sites Found' entry.")
+            continue
+
+        last_day_of_quarter = get_last_day_of_quarter(row["Quarter"])
+        fields = {
+            "Company Name": row["Site Name"],
+            "Total Threats": row["Total Threats"],
+            "Resolved Threats": row["Resolved Threats"],
+            "Unresolved Threats": row["Unresolved Threats"],
+            "Quarter": last_day_of_quarter
+        }
+
+        record_data = {"fields": fields}
+
+        try:
+            response = requests.post(airtable_url, headers=headers, json=record_data)
+            response.raise_for_status()
+            logging.info(f"Successfully uploaded data for {row['Site Name']}, {row['Quarter']} to Airtable")
+            print(f"Successfully uploaded data for {row['Site Name']}, {row['Quarter']} to Airtable")
+
+        except requests.exceptions.HTTPError as e:
+            logging.error(f"HTTP error while uploading data for {row['Site Name']}, {row['Quarter']}: {e.response.status_code} - {e.response.text}")
+            print(f"HTTP error while uploading data for {row['Site Name']}, {row['Quarter']}: {e.response.status_code} - {e.response.text}")
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to upload data to Airtable for {row['Site Name']}, {row['Quarter']}: {str(e)}")
+            print(f"Failed to upload data to Airtable for {row['Site Name']}, {row['Quarter']}: {str(e)}")
+
+        finally:
+            time.sleep(SECONDS_PER_REQUEST)
+            print(f"Waiting {SECONDS_PER_REQUEST} seconds due to rate limiting...")
+
+def main():
+    # Configuration
+    api_token = ""
+    domain = "<your management subdomain>.sentinelone.net"
+
+    if not api_token or not domain:
+        raise ValueError("Please set SENTINELONE_API_TOKEN and SENTINELONE_DOMAIN environment variables")
+
+    # Get the previous quarter's date range
+    current_date = datetime.now()
+    start_date, end_date = get_previous_quarter_date_range(current_date)
+
+    # Initialize API client
+    client = SentinelOneAPI(api_token, domain)
+
+    try:
+        # Fetch threats for the previous quarter
+        logging.info(f"Fetching threats from {start_date.date()} to {end_date.date()}...")
+        print(f"Fetching threats from {start_date.date()} to {end_date.date()}...")
+        threats = client.get_threats(
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        # Get the quarter label for the previous quarter
+        quarter_label = get_quarter(start_date)
+
+        # Create quarterly summaries for the previous quarter
+        logging.info(f"Creating quarterly summaries for {quarter_label}...")
+        print(f"Creating quarterly summaries for {quarter_label}...")
+        summary_df = create_site_quarterly_summaries(threats, quarter_label)
+
+        # Upload to Airtable
+        logging.info("Uploading data to Airtable...")
+        print("Uploading data to Airtable...")
+        upload_to_airtable(summary_df)
+
+        logging.info("Data successfully uploaded to Airtable!")
+        print("Data successfully uploaded to Airtable!")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching threats: {e}")
+        print(f"Error fetching threats: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
