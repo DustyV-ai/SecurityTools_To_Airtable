@@ -1,0 +1,337 @@
+import requests
+import json
+import sys
+import time
+from datetime import datetime, timedelta
+import pytz
+import logging
+
+# Your Perch API credentials
+CLIENT_ID = ""
+CLIENT_SECRET = ""
+
+# Airtable credentials - Replace with your actual values
+AIRTABLE_API_KEY = ""
+AIRTABLE_BASE_ID = ""
+AIRTABLE_TABLE_NAME = ""
+
+# Configure logging
+logging.basicConfig(filename='perch_to_airtable.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Airtable API rate limit (requests per second)
+AIRTABLE_RATE_LIMIT = 5
+# Calculate the delay between requests (in seconds)
+REQUEST_DELAY = 1 / AIRTABLE_RATE_LIMIT
+
+def get_auth_token():
+    """
+    Authenticate with Perch API and get access token
+    """
+    auth_url = "https://access.perchsecurity.com/oauth/token"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "audience": "https://api.perchsecurity.com",
+        "grant_type": "client_credentials"
+    }
+
+    try:
+        response = requests.post(auth_url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()["access_token"]
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Authentication failed: {str(e)}")
+        sys.exit(1)
+
+def get_companies(token):
+    """
+    Retrieve all companies from Perch API
+    """
+    companies_url = "http://api.perchsecurity.com/company/names"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        response = requests.get(companies_url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to retrieve companies: {str(e)}")
+        sys.exit(1)
+
+def get_alerts(token, team_id, page=1):
+    """
+    Retrieve alerts for a specific team
+    """
+    url = "http://api.perchsecurity.com/v1/alerts"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        'team_id': team_id,
+        'page_size': 1000,
+        'page': page
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to retrieve alerts: {str(e)}")
+        return None
+
+def get_escalations(token, team_id, page=1):
+    """
+    Retrieve escalations for a specific team
+    """
+    url = "http://api.perchsecurity.com/v1/escalations"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        'team_id': team_id,
+        'page_size': 1000,
+        'page_number': page
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to retrieve escalations: {str(e)}")
+        return None
+
+def get_all_alerts(token, team_id):
+    """
+    Retrieve all alerts for a specific team, handling pagination
+    """
+    all_alerts = []
+    page = 1
+    while True:
+        alerts_data = get_alerts(token, team_id, page)
+        if not alerts_data or not alerts_data.get('results'):
+            break
+        all_alerts.extend(alerts_data['results'])
+        page_size = alerts_data.get('page_size', 1000)
+        if (page - 1) * page_size + len(alerts_data['results']) >= alerts_data.get('total_count', float('inf')):
+            break
+        page += 1
+    return all_alerts
+
+def get_all_escalations(token, team_id):
+    """
+    Retrieve all escalations for a specific team, handling pagination
+    """
+    all_escalations = []
+    page = 1
+    while True:
+        escalations_data = get_escalations(token, team_id, page)
+        if not escalations_data or not escalations_data.get('results'):
+            break
+        all_escalations.extend(escalations_data['results'])
+        page_size = escalations_data.get('page_size', 1000)
+        if (page - 1) * page_size + len(escalations_data['results']) >= escalations_data.get('total_count', float('inf')):
+            break
+        page += 1
+    return all_escalations
+
+def filter_events_by_quarter(events, start_date, end_date, date_field='created_at'):
+    """
+    Filter events based on the specified date range.
+
+    Args:
+        events: List of events (alerts or escalations).
+        start_date: Start date of the quarter.
+        end_date: End date of the quarter.
+        date_field: The field in the event data containing the relevant date ('created_at' or 'escalated_at').
+
+    Returns:
+        List of events that fall within the specified quarter.
+    """
+    filtered_events = []
+    for event in events:
+        event_date_str = event.get(date_field)
+        if event_date_str:
+            try:
+                event_date = datetime.fromisoformat(event_date_str.replace('Z', '+00:00'))
+                if start_date <= event_date <= end_date:
+                    filtered_events.append(event)
+            except ValueError:
+                logging.warning(f"Invalid date format for event: {event}")
+    return filtered_events
+
+def get_metrics_for_period(token, team_id, start_date, end_date):
+    """
+    Get total alerts and escalations for a specific period
+    """
+    metrics = {'alerts': 0, 'escalations': 0}
+
+    # Get all alerts for the team
+    all_alerts = get_all_alerts(token, team_id)
+
+    # Filter alerts by the quarter dates
+    filtered_alerts = filter_events_by_quarter(all_alerts, start_date, end_date)
+    metrics['alerts'] = len(filtered_alerts)
+
+    # Get all escalations for the team
+    all_escalations = get_all_escalations(token, team_id)
+
+    # Filter escalations by the quarter dates
+    filtered_escalations = filter_events_by_quarter(all_escalations, start_date, end_date)
+    metrics['escalations'] = len(filtered_escalations)
+
+    return metrics
+
+def get_quarterly_dates():
+    """
+    Get start and end dates for the last 8 quarters (2 years)
+    Returns a list of dictionaries with start, end, label, and last_day keys.
+    """
+    now = datetime.now(pytz.UTC)
+    quarters = []
+
+    for i in range(8):
+        end_date = now - timedelta(days=90 * i)
+        start_date = end_date - timedelta(days=90)
+
+        # Calculate the last day of the quarter
+        if end_date.month <= 3:
+            last_day = datetime(end_date.year, 3, 31, tzinfo=pytz.UTC)
+        elif end_date.month <= 6:
+            last_day = datetime(end_date.year, 6, 30, tzinfo=pytz.UTC)
+        elif end_date.month <= 9:
+            last_day = datetime(end_date.year, 9, 30, tzinfo=pytz.UTC)
+        else:
+            last_day = datetime(end_date.year, 12, 31, tzinfo=pytz.UTC)
+
+        quarters.append({
+            'start': start_date,
+            'end': end_date,
+            'label': f"{end_date.year}-Q{((end_date.month - 1) // 3) + 1}",
+            'last_day': last_day.date()
+        })
+
+    return list(reversed(quarters))
+
+def export_to_airtable(companies, metrics_by_quarter):
+    """
+    Export companies data with quarterly metrics to Airtable, creating
+    one record per company per quarter for alerts and another for escalations.
+    Includes rate limiting and enhanced error handling.
+    """
+    airtable_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    quarters = get_quarterly_dates()
+
+    for company in companies:
+        for quarter in quarters:
+            quarter_key = quarter['label']
+            quarter_metrics = metrics_by_quarter.get(str(company['id']), {}).get(quarter_key, {'escalations': 0, 'alerts': 0})
+
+            # Prepare Airtable record data for Alerts
+            fields_alerts = {
+                "Company Name": company['name'],
+                "Count": quarter_metrics['alerts'],
+                "Status": "Alerts",
+                "Quarter": quarter['last_day'].isoformat()
+            }
+
+            # Prepare Airtable record data for Escalations
+            fields_escalations = {
+                "Company Name": company['name'],
+                "Count": quarter_metrics['escalations'],
+                "Status": "Escalations",
+                "Quarter": quarter['last_day'].isoformat()
+            }
+
+            record_data_alerts = {"fields": fields_alerts}
+            record_data_escalations = {"fields": fields_escalations}
+
+            try:
+                # Upload the Alerts record
+                response = requests.post(airtable_url, headers=headers, json=record_data_alerts)
+                response.raise_for_status()
+                logging.info(f"Successfully added Alerts data for {company['name']}, {quarter_key} to Airtable")
+                print(f"Successfully added Alerts data for {company['name']}, {quarter_key} to Airtable")
+
+            except requests.exceptions.HTTPError as e:
+                logging.error(f"HTTP error while adding Alerts data for {company['name']}, {quarter_key}: {e.response.status_code} - {e.response.text}")
+                print(f"HTTP error while adding Alerts data for {company['name']}, {quarter_key}: {e.response.status_code} - {e.response.text}")
+                # Implement retry logic or other error handling here if needed
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Failed to add Alerts data to Airtable for {company['name']}, {quarter_key}: {str(e)}")
+                print(f"Failed to add Alerts data to Airtable for {company['name']}, {quarter_key}: {str(e)}")
+                # Handle other request exceptions (e.g., connection errors)
+
+            finally:
+                # Wait for the calculated delay to respect rate limits
+                time.sleep(REQUEST_DELAY)
+                print(f"Waiting {REQUEST_DELAY} seconds due to rate limiting...")
+
+            try:
+                # Upload the Escalations record
+                response = requests.post(airtable_url, headers=headers, json=record_data_escalations)
+                response.raise_for_status()
+                logging.info(f"Successfully added Escalations data for {company['name']}, {quarter_key} to Airtable")
+                print(f"Successfully added Escalations data for {company['name']}, {quarter_key} to Airtable")
+
+            except requests.exceptions.HTTPError as e:
+                logging.error(f"HTTP error while adding Escalations data for {company['name']}, {quarter_key}: {e.response.status_code} - {e.response.text}")
+                print(f"HTTP error while adding Escalations data for {company['name']}, {quarter_key}: {e.response.status_code} - {e.response.text}")
+                # Implement retry logic or other error handling here if needed
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Failed to add Escalations data to Airtable for {company['name']}, {quarter_key}: {str(e)}")
+                print(f"Failed to add Escalations data to Airtable for {company['name']}, {quarter_key}: {str(e)}")
+                # Handle other request exceptions (e.g., connection errors)
+
+            finally:
+                # Wait for the calculated delay to respect rate limits
+                time.sleep(REQUEST_DELAY)
+                print(f"Waiting {REQUEST_DELAY} seconds due to rate limiting...")
+
+def main():
+    # Get authentication token
+    logging.info("Authenticating with Perch API...")
+    print("Authenticating with Perch API...")
+    token = get_auth_token()
+
+    # Get all companies
+    logging.info("Retrieving companies...")
+    print("Retrieving companies...")
+    companies = get_companies(token)
+
+    # Initialize metrics storage
+    metrics_by_quarter = {}
+
+    # Get metrics for each company by quarter for the last 8 quarters
+    quarters = get_quarterly_dates()
+    total_companies = len(companies)
+    for i, company in enumerate(companies, 1):
+        logging.info(f"Retrieving metrics for company {i}/{total_companies}: {company['name']}")
+        print(f"Retrieving metrics for company {i}/{total_companies}: {company['name']}")
+        company_metrics = {}
+
+        for quarter in quarters:
+            metrics = get_metrics_for_period(
+                token,
+                company['id'],
+                quarter['start'],
+                quarter['end']
+            )
+
+            company_metrics[quarter['label']] = metrics
+
+        metrics_by_quarter[str(company['id'])] = company_metrics
+
+    # Export to Airtable
+    logging.info("Exporting data to Airtable...")
+    print("Exporting data to Airtable...")
+    export_to_airtable(companies, metrics_by_quarter)
+
+if __name__ == "__main__":
+    main()
